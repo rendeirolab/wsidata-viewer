@@ -1,0 +1,36 @@
+[project]
+name = "wsidata-viewer"
+version = "0.1.0"
+description = "Interactive web viewer for wsidata whole slide images"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Yimin Zheng", email = "yzheng@cemm.at" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "wsidata",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pillow>=10.0",
+    "jinja2>=3.1",
+    "click>=8.1",
+    "geopandas>=0.14",
+]
+
+[project.scripts]
+wsidata-viewer = "wsidata_viewer._cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wsidata_viewer"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "ipykernel>=7.2.0",
+    "pip>=26.0.1",
+]
