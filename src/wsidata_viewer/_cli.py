@@ -58,7 +58,6 @@ def main(
     import webbrowser
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    import uvicorn
     from wsidata import open_wsi
 
     from ._server import SlideSpec, create_app
@@ -144,7 +143,58 @@ def main(
         f"Viewer → {url}  ({n} slide{'s' if n != 1 else ''}, Ctrl-C to stop)",
         err=True,
     )
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    _run_with_graceful_shutdown(app, host=host, port=port)
+
+
+def _run_with_graceful_shutdown(app, host: str, port: int) -> None:
+    """Run uvicorn with escalating Ctrl-C handling.
+
+    First SIGINT  → graceful shutdown (drain in-flight requests, run app
+                    shutdown handlers — resources released).
+    Second SIGINT → force exit (uvicorn aborts request loop immediately).
+    Third+ SIGINT → os._exit(130), bypass interpreter cleanup.
+    """
+    import os
+    import signal
+
+    import uvicorn
+
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(config)
+
+    sigint_count = {"n": 0}
+    original_handler = signal.getsignal(signal.SIGINT)
+
+    def _handler(signum, frame):
+        sigint_count["n"] += 1
+        n = sigint_count["n"]
+        if n == 1:
+            click.echo(
+                "\nCtrl-C: graceful shutdown … "
+                "(hit Ctrl-C again to force, 3x to kill)",
+                err=True,
+            )
+            server.should_exit = True
+        elif n == 2:
+            click.echo("Ctrl-C x2: forcing shutdown …", err=True)
+            server.force_exit = True
+        else:
+            click.echo("Ctrl-C x3: killing process.", err=True)
+            os._exit(130)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+    # uvicorn's own signal handlers would override ours; disable them.
+    server.install_signal_handlers = lambda: None  # type: ignore[assignment]
+
+    try:
+        server.run()
+    finally:
+        try:
+            signal.signal(signal.SIGINT, original_handler)
+        except Exception:
+            pass
 
 
 def _entries_from_table(table_path: str) -> list[tuple[str, str | None]]:

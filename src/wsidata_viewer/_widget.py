@@ -5,7 +5,7 @@ import atexit
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from wsidata import WSIData
+    pass
 
 # key = cache_key (int or frozenset of int), value = (server, port)
 _running_servers: dict = {}

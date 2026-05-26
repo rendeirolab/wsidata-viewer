@@ -4,7 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{ slide_name }} — wsidata viewer</title>
+  <link rel="icon" type="image/webp" href="/favicon.webp">
   <script src="https://cdn.jsdelivr.net/npm/openseadragon@4.1/build/openseadragon/openseadragon.min.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.27/dist.min.js"></script>
+  <script src="https://unpkg.com/flatgeobuf@3.27.2/dist/flatgeobuf-geojson.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -62,6 +65,12 @@
     #viewer-container { flex: 1; position: relative; overflow: hidden; }
     #osd { width: 100%; height: 100%; background: #0d0d0d; }
     #overlay-canvas { position: absolute; inset: 0; pointer-events: none; width: 100%; height: 100%; }
+    #deck-canvas { position: absolute; inset: 0; pointer-events: none; width: 100%; height: 100%; }
+    /* Kill browser focus ring on OSD/canvas (distracting blue outline on click) */
+    #viewer-container, #viewer-container *,
+    #osd, #osd *, #osd canvas,
+    #overlay-canvas, #deck-canvas { outline: none !important; }
+    #viewer-container :focus, #viewer-container :focus-visible { outline: none !important; box-shadow: none !important; }
 
     /* ── Shared floating panel ──────────────────────────────── */
     .fp {
@@ -181,6 +190,40 @@
     }
     .legend-minmax { display: flex; justify-content: space-between; margin-top: 2px; }
 
+    /* ── Feature tooltip ────────────────────────────────────── */
+    #feature-tooltip {
+      position: absolute;
+      min-width: 160px; max-width: 280px;
+      padding: 8px 10px 9px;
+      background: rgba(16,16,16,0.95);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      font-size: 11px; color: #ddd;
+      z-index: 300; pointer-events: auto;
+      display: none;
+    }
+    #feature-tooltip .tt-hdr {
+      display: flex; align-items: center; gap: 6px;
+      margin: 0 0 5px;
+      font-size: 10px; color: #888;
+      text-transform: uppercase; letter-spacing: .05em;
+    }
+    #feature-tooltip .tt-layer { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #feature-tooltip .tt-close {
+      cursor: pointer; color: #666; background: none; border: none;
+      padding: 0 2px; font-size: 14px; line-height: 1;
+    }
+    #feature-tooltip .tt-close:hover { color: #ddd; }
+    #feature-tooltip .tt-row { display: flex; justify-content: space-between; gap: 10px; padding: 1px 0; }
+    #feature-tooltip .tt-key { color: #666; white-space: nowrap; }
+    #feature-tooltip .tt-val {
+      color: #ddd; text-align: right;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      max-width: 180px;
+    }
+
     /* ── Status bar ─────────────────────────────────────────── */
     #status { bottom: 8px; left: 10px; padding: 3px 9px; font-size: 11px; color: rgba(160,160,160,0.55); pointer-events: none; }
 
@@ -222,6 +265,7 @@
 <div id="viewer-container">
   <div id="osd"></div>
   <canvas id="overlay-canvas"></canvas>
+  <canvas id="deck-canvas"></canvas>
 
   <!-- ── Layers panel ──────────────────────────────────────── -->
   <div id="layers-panel" class="fp">
@@ -286,6 +330,15 @@
     <div id="scale-bar-label"></div>
   </div>
 
+  <!-- ── Feature tooltip ───────────────────────────────────── -->
+  <div id="feature-tooltip">
+    <div class="tt-hdr">
+      <span class="tt-layer" id="tt-layer"></span>
+      <button class="tt-close" id="tt-close" title="Close">×</button>
+    </div>
+    <div id="tt-body"></div>
+  </div>
+
   <!-- ── Status bar ────────────────────────────────────────── -->
   <div id="status" class="fp"></div>
 
@@ -313,6 +366,12 @@
     animationTime: 0.25,
     blendTime: 0.1,
     background: "#0d0d0d",
+    // Disable click-to-zoom (conflicts with tooltip/hit-test on click).
+    // Keep drag/pinch/wheel/dblclick intact.
+    gestureSettingsMouse:    { clickToZoom: false, dblClickToZoom: true },
+    gestureSettingsTouch:    { clickToZoom: false, dblClickToZoom: true },
+    gestureSettingsPen:      { clickToZoom: false, dblClickToZoom: true },
+    gestureSettingsUnknown:  { clickToZoom: false, dblClickToZoom: true },
   });
 
   document.getElementById("btn-zoomin").onclick  = () => { viewer.viewport.zoomBy(2,   viewer.viewport.getCenter()); viewer.viewport.applyConstraints(); };
@@ -350,6 +409,13 @@
     canvas.style.width  = rect.width  + "px";
     canvas.style.height = rect.height + "px";
     ctx.scale(dpr, dpr);
+    // Resize deck canvas (CSS only — deck.gl manages backing store)
+    const dc = document.getElementById("deck-canvas");
+    if (dc) {
+      dc.style.width = rect.width + "px";
+      dc.style.height = rect.height + "px";
+    }
+    if (deck && typeof deck.redraw === "function") deck.redraw(true);
     drawAllLayers();
   }
   new ResizeObserver(resizeCanvas).observe(container);
@@ -414,9 +480,14 @@
   const layerColumns    = {};   // name → [{name, kind, ...}, ...]
   const layerColoring   = {};   // name → {column: null|"colname", scheme: ...}
   const layerStyleEls   = {};   // name → styleEl DOM node
+  const layerRenderer   = {};   // name → "canvas" | "webgl"
+  const layerBbox       = {};   // name → Float32Array [minX,minY,maxX,maxY,...]
+  const layerFeatures   = {};   // name → parsed feature array (webgl path)
+
+  const WEBGL_THRESHOLD = 5000;
 
   function defaultStyle(color) {
-    return { strokeColor: color, strokeWidth: 1.5, fillEnabled: true, fillColor: color };
+    return { strokeColor: color, strokeWidth: 1, fillEnabled: true, fillColor: color, fillAlpha: 0.20 };
   }
 
   // ── Color helpers ────────────────────────────────────────────────────
@@ -430,10 +501,35 @@
     "#aa44ff","#00bbbb","#ffcc00","#ff44aa",
   ];
 
+  // Golden-ratio HSL for overflow beyond palette — guarantees distinct hues.
+  // Offset hue so first generated color doesn't clash with palette end.
+  const GOLDEN_RATIO_CONJUGATE = 0.6180339887498949;
+  function hslToHex(h, s, l) {
+    s /= 100; l /= 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = n => {
+      const c = l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+      return Math.round(255 * c).toString(16).padStart(2, "0");
+    };
+    return `#${f(0)}${f(8)}${f(4)}`;
+  }
+  function overflowHue(i) {
+    // i = index past palette length. Cycle saturation/lightness to add separation.
+    const hue = ((i + 1) * GOLDEN_RATIO_CONJUGATE * 360) % 360;
+    const sat = 65 + (i % 3) * 10;   // 65 / 75 / 85
+    const lig = 55 + ((i >> 1) % 2) * 10; // 55 / 65
+    return hslToHex(hue, sat, lig);
+  }
+
   function buildScheme(colMeta) {
     if (colMeta.kind === "categorical") {
       const map = {};
-      colMeta.categories.forEach((cat, i) => { map[cat] = CAT_PALETTE[i % CAT_PALETTE.length]; });
+      colMeta.categories.forEach((cat, i) => {
+        map[cat] = i < CAT_PALETTE.length
+          ? CAT_PALETTE[i]
+          : overflowHue(i - CAT_PALETTE.length);
+      });
       return { kind: "categorical", map };
     }
     return { kind: "numeric", min: colMeta.min, max: colMeta.max };
@@ -453,32 +549,399 @@
     return `#${r.toString(16).padStart(2,"0")}${g.toString(16).padStart(2,"0")}${b.toString(16).padStart(2,"0")}`;
   }
 
+  // ── Bbox helpers ─────────────────────────────────────────────────────
+  function geomBbox(g, out) {
+    // out = [minX, minY, maxX, maxY], updated in place
+    switch (g.type) {
+      case "Polygon":
+        for (const ring of g.coordinates)
+          for (const [x, y] of ring) {
+            if (x < out[0]) out[0] = x;
+            if (y < out[1]) out[1] = y;
+            if (x > out[2]) out[2] = x;
+            if (y > out[3]) out[3] = y;
+          }
+        break;
+      case "MultiPolygon":
+        for (const poly of g.coordinates)
+          for (const ring of poly)
+            for (const [x, y] of ring) {
+              if (x < out[0]) out[0] = x;
+              if (y < out[1]) out[1] = y;
+              if (x > out[2]) out[2] = x;
+              if (y > out[3]) out[3] = y;
+            }
+        break;
+      case "Point":
+        { const [x, y] = g.coordinates;
+          if (x < out[0]) out[0] = x;
+          if (y < out[1]) out[1] = y;
+          if (x > out[2]) out[2] = x;
+          if (y > out[3]) out[3] = y; }
+        break;
+      case "MultiPoint":
+        for (const [x, y] of g.coordinates) {
+          if (x < out[0]) out[0] = x;
+          if (y < out[1]) out[1] = y;
+          if (x > out[2]) out[2] = x;
+          if (y > out[3]) out[3] = y;
+        }
+        break;
+    }
+  }
+
+  function buildBboxArray(feats) {
+    const arr = new Float32Array(feats.length * 4);
+    for (let i = 0; i < feats.length; i++) {
+      const o = [Infinity, Infinity, -Infinity, -Infinity];
+      if (feats[i].geometry) geomBbox(feats[i].geometry, o);
+      arr[i*4] = o[0]; arr[i*4+1] = o[1]; arr[i*4+2] = o[2]; arr[i*4+3] = o[3];
+    }
+    return arr;
+  }
+
+  function viewportImageBbox() {
+    if (!viewer.viewport) return null;
+    const b = viewer.viewport.getBounds();
+    const tl = viewer.viewport.viewportToImageCoordinates(new OpenSeadragon.Point(b.x, b.y));
+    const br = viewer.viewport.viewportToImageCoordinates(new OpenSeadragon.Point(b.x + b.width, b.y + b.height));
+    return [Math.min(tl.x, br.x), Math.min(tl.y, br.y), Math.max(tl.x, br.x), Math.max(tl.y, br.y)];
+  }
+
+  function screenPxPerImagePxNow() {
+    const [x0] = imgPxToCanvas(0, 0);
+    const [x1] = imgPxToCanvas(1000, 0);
+    return Math.abs(x1 - x0) / 1000;
+  }
+
+  // ── Feature tooltip ──────────────────────────────────────────────────
+  const tooltipEl = document.getElementById("feature-tooltip");
+  const ttLayerEl = document.getElementById("tt-layer");
+  const ttBodyEl  = document.getElementById("tt-body");
+  document.getElementById("tt-close").addEventListener("click", () => {
+    tooltipEl.style.display = "none";
+  });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;",
+    }[c]));
+  }
+
+  function formatVal(v) {
+    if (v == null) return "—";
+    if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(4);
+    return String(v);
+  }
+
+  function showFeatureTooltip(layerName, props, clientX, clientY) {
+    ttLayerEl.textContent = layerName;
+    ttBodyEl.innerHTML = "";
+    const entries = Object.entries(props || {});
+    if (!entries.length) {
+      const row = document.createElement("div");
+      row.className = "tt-row";
+      row.innerHTML = `<span class="tt-key">no properties</span>`;
+      ttBodyEl.appendChild(row);
+    } else {
+      for (const [k, v] of entries) {
+        const row = document.createElement("div");
+        row.className = "tt-row";
+        row.innerHTML = `<span class="tt-key">${escapeHtml(k)}</span><span class="tt-val" title="${escapeHtml(formatVal(v))}">${escapeHtml(formatVal(v))}</span>`;
+        ttBodyEl.appendChild(row);
+      }
+    }
+    // Position relative to viewer-container
+    const rect = container.getBoundingClientRect();
+    let x = clientX - rect.left + 12;
+    let y = clientY - rect.top + 12;
+    tooltipEl.style.display = "block";
+    // Clamp inside container after layout
+    const tw = tooltipEl.offsetWidth, th = tooltipEl.offsetHeight;
+    if (x + tw > rect.width  - 4) x = clientX - rect.left - tw - 12;
+    if (y + th > rect.height - 4) y = clientY - rect.top - th - 12;
+    tooltipEl.style.left = Math.max(4, x) + "px";
+    tooltipEl.style.top  = Math.max(4, y) + "px";
+  }
+
+  // ── Canvas2D hit test (bbox + point-in-polygon) ──────────────────────
+  function pointInRing(x, y, ring) {
+    // Even-odd ray cast
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const xi = ring[i][0], yi = ring[i][1];
+      const xj = ring[j][0], yj = ring[j][1];
+      if (((yi > y) !== (yj > y)) &&
+          (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi)) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+  function pointInPolygon(x, y, rings) {
+    if (!rings.length) return false;
+    if (!pointInRing(x, y, rings[0])) return false;
+    for (let i = 1; i < rings.length; i++) {
+      if (pointInRing(x, y, rings[i])) return false; // hole
+    }
+    return true;
+  }
+  function hitTestCanvas2D(imgX, imgY) {
+    // Iterate visible canvas layers in reverse (topmost first)
+    for (let li = layerMeta.length - 1; li >= 0; li--) {
+      const m = layerMeta[li];
+      if (layerRenderer[m.name] === "webgl") continue;
+      if (!layerVisible[m.name] || layerFetchState[m.name] !== "loaded") continue;
+      const feats = (layerData[m.name] && layerData[m.name].features) || [];
+      const bbox = layerBbox[m.name];
+      if (!bbox) continue;
+      for (let i = 0; i < feats.length; i++) {
+        const minX = bbox[i*4], minY = bbox[i*4+1], maxX = bbox[i*4+2], maxY = bbox[i*4+3];
+        if (imgX < minX || imgX > maxX || imgY < minY || imgY > maxY) continue;
+        const g = feats[i].geometry;
+        if (!g) continue;
+        let hit = false;
+        if (g.type === "Polygon") hit = pointInPolygon(imgX, imgY, g.coordinates);
+        else if (g.type === "MultiPolygon") {
+          for (const poly of g.coordinates) if (pointInPolygon(imgX, imgY, poly)) { hit = true; break; }
+        } else if (g.type === "Point" || g.type === "MultiPoint") {
+          // bbox hit is good enough for points (bbox is zero-area, only matches near pixel)
+          hit = true;
+        }
+        if (hit) return { layerName: m.name, properties: feats[i].properties || {} };
+      }
+    }
+    return null;
+  }
+
+  // OSD emits canvas-click only for non-drag clicks. Use it for hit-test.
+  function handlePickClick(clientX, clientY) {
+    const rect = container.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+
+    // 1) deck.gl picking for WebGL layers
+    if (deck && typeof deck.pickObject === "function") {
+      try {
+        const info = deck.pickObject({ x: px, y: py, radius: 2 });
+        if (info && info.object) {
+          const props = info.object.properties || {};
+          const layerName = info.layer && info.layer.id ? info.layer.id.replace(/^wsi-/, "") : "";
+          showFeatureTooltip(layerName, props, clientX, clientY);
+          return;
+        }
+      } catch (e) { /* fall through */ }
+    }
+
+    // 2) Canvas2D hit test
+    if (!viewer.viewport) return;
+    const elPt = new OpenSeadragon.Point(px, py);
+    const vp = viewer.viewport.viewerElementToViewportCoordinates(elPt);
+    const ip = viewer.viewport.viewportToImageCoordinates(vp);
+    const hit = hitTestCanvas2D(ip.x, ip.y);
+    if (hit) showFeatureTooltip(hit.layerName, hit.properties, clientX, clientY);
+    else tooltipEl.style.display = "none";
+  }
+
+  viewer.addHandler("canvas-click", (ev) => {
+    if (!ev.quick) return; // ignore drags
+    const oe = ev.originalEvent;
+    handlePickClick(oe.clientX, oe.clientY);
+  });
+
+  // Allow Esc to dismiss tooltip
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") tooltipEl.style.display = "none";
+  });
+
+  // ── deck.gl setup ────────────────────────────────────────────────────
+  let deck = null;
+  function ensureDeck() {
+    if (deck) return deck;
+    if (typeof deckgl === "undefined" && typeof window.deck === "undefined") return null;
+    const D = window.deck || window.deckgl;
+    deck = new D.Deck({
+      canvas: "deck-canvas",
+      views: [new D.OrthographicView({ flipY: true })],
+      initialViewState: { target: [SLIDE_WIDTH/2, SLIDE_HEIGHT/2, 0], zoom: 0 },
+      controller: false,
+      layers: [],
+    });
+    return deck;
+  }
+
+  function syncDeckViewport() {
+    if (!deck || !viewer.viewport) return;
+    const c = viewer.viewport.getCenter();
+    const ip = viewer.viewport.viewportToImageCoordinates(c);
+    const s = screenPxPerImagePxNow();
+    if (s <= 0) return;
+    deck.setProps({
+      viewState: { target: [ip.x, ip.y, 0], zoom: Math.log2(s) },
+    });
+  }
+
+  function hexToRgbArr(h, alpha) {
+    const n = parseInt(h.replace("#",""), 16);
+    return [(n>>16)&255, (n>>8)&255, n&255, alpha];
+  }
+
+  function buildWebglLayer(meta) {
+    const D = window.deck || window.deckgl;
+    const feats = layerFeatures[meta.name] || [];
+    const style = layerStyles[meta.name];
+    const coloring = layerColoring[meta.name];
+    // deck.gl handles GPU culling via projection; we pass full data so buffer
+    // is reused across viewport updates (no re-tessellation on pan/zoom).
+    const visible = feats;
+
+    const fillAlpha = style.fillEnabled ? Math.round((style.fillAlpha ?? 0.20) * 255) : 0;
+    const lineAlpha = 230; // 0.9 * 255
+
+    const getFillColor = (f) => {
+      if (!coloring || !coloring.column) return hexToRgbArr(style.fillColor, fillAlpha);
+      const v = f.properties ? f.properties[coloring.column] : undefined;
+      let c;
+      if (coloring.scheme.kind === "categorical") {
+        c = coloring.scheme.map[String(v)] ?? "#888888";
+      } else {
+        c = v != null ? interpolateNumericColor(v, coloring.scheme) : "#888888";
+      }
+      return hexToRgbArr(c, fillAlpha);
+    };
+    const getLineColor = (f) => {
+      if (!coloring || !coloring.column) return hexToRgbArr(style.strokeColor, lineAlpha);
+      const v = f.properties ? f.properties[coloring.column] : undefined;
+      let c;
+      if (coloring.scheme.kind === "categorical") {
+        c = coloring.scheme.map[String(v)] ?? "#888888";
+      } else {
+        c = v != null ? interpolateNumericColor(v, coloring.scheme) : "#888888";
+      }
+      return hexToRgbArr(c, lineAlpha);
+    };
+
+    // Detect geometry type from first valid feature
+    const first = visible.find(f => f.geometry);
+    const isPoint = first && (first.geometry.type === "Point" || first.geometry.type === "MultiPoint");
+
+    if (isPoint) {
+      return new D.ScatterplotLayer({
+        id: `wsi-${meta.name}`,
+        data: visible,
+        pickable: true,
+        getPosition: f => f.geometry.coordinates,
+        getRadius: 4,
+        radiusUnits: "pixels",
+        getFillColor,
+        getLineColor,
+        stroked: true,
+        filled: style.fillEnabled,
+        lineWidthUnits: "pixels",
+        getLineWidth: style.strokeWidth,
+        updateTriggers: {
+          getFillColor: [style.fillColor, style.fillEnabled, style.fillAlpha, coloring],
+          getLineColor: [style.strokeColor, coloring],
+          getLineWidth: [style.strokeWidth],
+        },
+      });
+    }
+
+    return new D.PolygonLayer({
+      id: `wsi-${meta.name}`,
+      data: visible,
+      pickable: true,
+      getPolygon: f => {
+        const g = f.geometry;
+        if (!g) return [];
+        if (g.type === "Polygon") return g.coordinates;
+        if (g.type === "MultiPolygon") return g.coordinates[0]; // simplification: first poly only
+        return [];
+      },
+      getFillColor,
+      getLineColor,
+      stroked: true,
+      filled: style.fillEnabled,
+      lineWidthUnits: "pixels",
+      getLineWidth: style.strokeWidth,
+      updateTriggers: {
+        getFillColor: [style.fillColor, style.fillEnabled, style.fillAlpha, coloring],
+        getLineColor: [style.strokeColor, coloring],
+        getLineWidth: [style.strokeWidth],
+      },
+    });
+  }
+
+  function updateDeckLayers() {
+    const d = ensureDeck();
+    if (!d) return;
+    const layers = [];
+    for (const m of layerMeta) {
+      if (layerRenderer[m.name] !== "webgl") continue;
+      if (!layerVisible[m.name]) continue;
+      if (layerFetchState[m.name] !== "loaded") continue;
+      layers.push(buildWebglLayer(m));
+    }
+    d.setProps({ layers });
+    syncDeckViewport();
+  }
+
   // ── Drawing ──────────────────────────────────────────────────────────
+  // Lightweight per-frame redraw: canvas2D layers + deck viewport sync only.
   function drawAllLayers() {
     if (!viewer.viewport) return;
     const dpr = window.devicePixelRatio || 1;
     ctx.clearRect(0, 0, canvasW / dpr, canvasH / dpr);
+    let hasWebgl = false;
     for (const m of layerMeta) {
+      if (layerRenderer[m.name] === "webgl") { hasWebgl = true; continue; }
       if (layerVisible[m.name] && layerFetchState[m.name] === "loaded")
         drawLayer(layerData[m.name], layerStyles[m.name], m.name);
     }
+    if (hasWebgl) syncDeckViewport();
+  }
+
+  // Rebuild deck layers + canvas. Use when style/coloring/visibility change.
+  function rebuildLayers() {
+    updateDeckLayers();
+    drawAllLayers();
   }
 
   function drawLayer(geojson, style, name) {
     const feats = geojson.features || [];
-    if (feats.length > 5000 && viewer.viewport.getZoom() < 0.5) return;
 
     const coloring = layerColoring[name];
     ctx.lineWidth = style.strokeWidth;
 
+    // Spatial culling: skip features whose bbox doesn't intersect viewport.
+    // LOD: skip features smaller than 1 screen pixel.
+    const vp = viewportImageBbox();
+    const bbox = layerBbox[name];
+    const s = screenPxPerImagePxNow();
+    const minPxSize = 1;
+
+    const shouldDraw = (i) => {
+      if (!vp || !bbox) return true;
+      const minX = bbox[i*4], minY = bbox[i*4+1], maxX = bbox[i*4+2], maxY = bbox[i*4+3];
+      if (maxX < vp[0] || minX > vp[2] || maxY < vp[1] || minY > vp[3]) return false;
+      if ((maxX - minX) * s < minPxSize && (maxY - minY) * s < minPxSize) return false;
+      return true;
+    };
+
     if (!coloring || !coloring.column) {
       // Fast flat-color path — batch all features
       ctx.strokeStyle = `rgba(${hexRgb(style.strokeColor)},0.9)`;
-      ctx.fillStyle   = style.fillEnabled ? `rgba(${hexRgb(style.fillColor)},0.20)` : "transparent";
-      for (const f of feats) { if (f.geometry) drawGeom(f.geometry); }
+      ctx.fillStyle   = style.fillEnabled ? `rgba(${hexRgb(style.fillColor)},${style.fillAlpha ?? 0.20})` : "transparent";
+      for (let i = 0; i < feats.length; i++) {
+        if (!shouldDraw(i)) continue;
+        const f = feats[i];
+        if (f.geometry) drawGeom(f.geometry);
+      }
     } else {
       // Per-feature color path
-      for (const f of feats) {
+      for (let i = 0; i < feats.length; i++) {
+        if (!shouldDraw(i)) continue;
+        const f = feats[i];
         if (!f.geometry) continue;
         const val = f.properties ? f.properties[coloring.column] : undefined;
         let color;
@@ -488,7 +951,7 @@
           color = val != null ? interpolateNumericColor(val, coloring.scheme) : "#888888";
         }
         ctx.strokeStyle = `rgba(${hexRgb(color)},0.9)`;
-        ctx.fillStyle   = style.fillEnabled ? `rgba(${hexRgb(color)},0.20)` : "transparent";
+        ctx.fillStyle   = style.fillEnabled ? `rgba(${hexRgb(color)},${style.fillAlpha ?? 0.20})` : "transparent";
         drawGeom(f.geometry);
       }
     }
@@ -555,7 +1018,7 @@
         ? { column: col.name, meta: col, scheme: buildScheme(col) }
         : { column: null };
       renderLegend(meta);
-      drawAllLayers();
+      rebuildLayers();
     });
 
     const selRow = document.createElement("div");
@@ -611,21 +1074,55 @@
     layerVisible[meta.name] = false;
     cntEl.innerHTML = `<span class="layer-spinner">↻</span>`;
 
-    Promise.all([
-      fetch(`/overlays/${encodeURIComponent(meta.name)}.geojson`)
-        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-      fetch(`/overlays/${encodeURIComponent(meta.name)}/columns`)
-        .then(r => r.ok ? r.json() : []).catch(() => []),
-    ])
-    .then(([geojson, columns]) => {
-      layerData[meta.name]     = geojson;
+    const useWebgl = (meta.n_features ?? 0) >= WEBGL_THRESHOLD
+                     && typeof (window.deck || window.deckgl) !== "undefined"
+                     && typeof window.flatgeobuf !== "undefined";
+    layerRenderer[meta.name] = useWebgl ? "webgl" : "canvas";
+
+    const columnsP = fetch(`/overlays/${encodeURIComponent(meta.name)}/columns`)
+        .then(r => r.ok ? r.json() : []).catch(() => []);
+
+    let featsP;
+    if (useWebgl) {
+      // Stream FlatGeobuf — much smaller payload, faster parse
+      featsP = (async () => {
+        const url = `/overlays/${encodeURIComponent(meta.name)}.fgb`;
+        // Fetch as bytes and decode in one shot — avoids HTTP-range streaming
+        // path that requires a bbox rect argument.
+        const buf = await fetch(url).then(r => {
+          if (!r.ok) throw new Error("fgb " + r.status);
+          return r.arrayBuffer();
+        });
+        const bytes = new Uint8Array(buf);
+        const result = window.flatgeobuf.deserialize(bytes);
+        // deserialize(Uint8Array) returns a FeatureCollection
+        return (result && result.features) ? result.features : [];
+      })();
+    } else {
+      featsP = fetch(`/overlays/${encodeURIComponent(meta.name)}.geojson`)
+        .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(gj => gj.features || []);
+    }
+
+    Promise.all([featsP, columnsP])
+    .then(([feats, columns]) => {
+      // Build bbox array for culling/LOD (both paths benefit)
+      layerBbox[meta.name] = buildBboxArray(feats);
+
+      if (useWebgl) {
+        layerFeatures[meta.name] = feats;
+        // Canvas path also needs `layerData` shape for code-symmetry — store empty geojson
+        layerData[meta.name] = { features: [] };
+      } else {
+        layerData[meta.name] = { features: feats };
+      }
       layerColumns[meta.name]  = columns;
       layerColoring[meta.name] = { column: null };
       layerFetchState[meta.name] = "loaded";
-      cntEl.textContent = (geojson.features || []).length.toLocaleString();
+      cntEl.textContent = feats.length.toLocaleString();
       layerVisible[meta.name] = true;
       populateColumnPicker(meta);
-      drawAllLayers();
+      rebuildLayers();
     })
     .catch(err => {
       layerFetchState[meta.name] = "error";
@@ -661,7 +1158,7 @@
         fetchLayer(meta, chk, cnt);
       } else {
         layerVisible[meta.name] = chk.checked;
-        drawAllLayers();
+        rebuildLayers();
       }
     });
 
@@ -697,23 +1194,41 @@
     }
 
     const strokeCol = document.createElement("input"); strokeCol.type = "color"; strokeCol.value = st.strokeColor;
-    strokeCol.addEventListener("input", () => { st.strokeColor = strokeCol.value; sw.style.background = strokeCol.value; drawAllLayers(); });
+    strokeCol.addEventListener("input", () => { st.strokeColor = strokeCol.value; sw.style.background = strokeCol.value; rebuildLayers(); });
 
     const strokeW = document.createElement("input"); strokeW.type = "range";
     strokeW.min = "0.5"; strokeW.max = "10"; strokeW.step = "0.5"; strokeW.value = st.strokeWidth;
     const strokeWVal = document.createElement("span"); strokeWVal.className = "range-val"; strokeWVal.textContent = st.strokeWidth + "px";
-    strokeW.addEventListener("input", () => { st.strokeWidth = parseFloat(strokeW.value); strokeWVal.textContent = st.strokeWidth + "px"; drawAllLayers(); });
+    strokeW.addEventListener("input", () => { st.strokeWidth = parseFloat(strokeW.value); strokeWVal.textContent = st.strokeWidth + "px"; rebuildLayers(); });
 
     const fillChk = document.createElement("input"); fillChk.type = "checkbox"; fillChk.checked = st.fillEnabled;
     const fillCol = document.createElement("input"); fillCol.type = "color"; fillCol.value = st.fillColor;
     fillCol.disabled = !st.fillEnabled;
-    fillChk.addEventListener("change", () => { st.fillEnabled = fillChk.checked; fillCol.disabled = !fillChk.checked; drawAllLayers(); });
-    fillCol.addEventListener("input", () => { st.fillColor = fillCol.value; drawAllLayers(); });
+
+    const fillAlpha = document.createElement("input"); fillAlpha.type = "range";
+    fillAlpha.min = "0"; fillAlpha.max = "1"; fillAlpha.step = "0.05"; fillAlpha.value = st.fillAlpha ?? 0.20;
+    fillAlpha.disabled = !st.fillEnabled;
+    const fillAlphaVal = document.createElement("span"); fillAlphaVal.className = "range-val";
+    fillAlphaVal.textContent = Math.round((st.fillAlpha ?? 0.20) * 100) + "%";
+
+    fillChk.addEventListener("change", () => {
+      st.fillEnabled = fillChk.checked;
+      fillCol.disabled = !fillChk.checked;
+      fillAlpha.disabled = !fillChk.checked;
+      rebuildLayers();
+    });
+    fillCol.addEventListener("input", () => { st.fillColor = fillCol.value; rebuildLayers(); });
+    fillAlpha.addEventListener("input", () => {
+      st.fillAlpha = parseFloat(fillAlpha.value);
+      fillAlphaVal.textContent = Math.round(st.fillAlpha * 100) + "%";
+      rebuildLayers();
+    });
 
     styleEl.append(
       styleRow("Stroke", strokeCol),
       styleRow("Width",  strokeW, strokeWVal),
       styleRow("Fill",   fillChk, fillCol),
+      styleRow("Alpha",  fillAlpha, fillAlphaVal),
     );
 
     wrap.append(row, styleEl);
@@ -869,7 +1384,11 @@
       for (const k of Object.keys(layerColumns))     delete layerColumns[k];
       for (const k of Object.keys(layerColoring))    delete layerColoring[k];
       for (const k of Object.keys(layerStyleEls))    delete layerStyleEls[k];
+      for (const k of Object.keys(layerRenderer))    delete layerRenderer[k];
+      for (const k of Object.keys(layerBbox))        delete layerBbox[k];
+      for (const k of Object.keys(layerFeatures))    delete layerFeatures[k];
       layerMeta.length = 0;
+      if (deck) deck.setProps({ layers: [] });
       drawAllLayers();  // clear canvas immediately
 
       // Reload DZI (cache-buster ensures OSD re-fetches the descriptor)

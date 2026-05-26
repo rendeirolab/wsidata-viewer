@@ -2,23 +2,27 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from jinja2 import Environment, FileSystemLoader
 
 from ._dzi import DZIInfo, get_dzi_tile
+
+import logging
+
+_log = logging.getLogger("wsidata_viewer")
 
 if TYPE_CHECKING:
     from wsidata import WSIData
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
+_LOGO_PATH = _TEMPLATES_DIR / "logo.webp"
 
 # Shared thread pool for blocking WSI reads and GeoJSON serialisation
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -163,6 +167,18 @@ def create_app(
         )
         return HTMLResponse(html)
 
+    # ── Favicon ───────────────────────────────────────────────────────────
+    @app.get("/favicon.webp")
+    @app.get("/favicon.ico")
+    async def favicon() -> Response:
+        if not _LOGO_PATH.exists():
+            raise HTTPException(status_code=404, detail="favicon missing")
+        return FileResponse(
+            _LOGO_PATH,
+            media_type="image/webp",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     # ── DZI descriptor ────────────────────────────────────────────────────
     @app.get("/slide.dzi")
     async def dzi_descriptor() -> Response:
@@ -280,10 +296,18 @@ def create_app(
         wsi = current_wsi()
         all_keys = list(wsi.shapes.keys())
         keys = [k for k in all_keys if k in shape_keys] if shape_keys is not None else all_keys
-        return JSONResponse([
-            {"name": key, "color": _LAYER_COLORS[i % len(_LAYER_COLORS)]}
-            for i, key in enumerate(keys)
-        ])
+        result = []
+        for i, key in enumerate(keys):
+            try:
+                n = len(wsi.shapes[key])
+            except Exception:
+                n = 0
+            result.append({
+                "name": key,
+                "color": _LAYER_COLORS[i % len(_LAYER_COLORS)],
+                "n_features": n,
+            })
+        return JSONResponse(result)
 
     @app.get("/overlays/{name}/columns")
     async def overlay_columns(name: str) -> JSONResponse:
@@ -314,5 +338,72 @@ def create_app(
         loop = asyncio.get_running_loop()
         geojson_str = await loop.run_in_executor(_executor, wsi.shapes[name].to_json)
         return Response(content=geojson_str, media_type="application/json")
+
+    # FlatGeobuf cache keyed by (slide_index, layer_name)
+    _fgb_cache: dict[tuple[int, str], bytes] = {}
+
+    def _build_fgb(gdf) -> bytes:
+        """Serialise GeoDataFrame to FlatGeobuf bytes via pyogrio."""
+        from io import BytesIO
+
+        buf = BytesIO()
+        # pyogrio.write_dataframe handles FlatGeobuf via GDAL driver
+        try:
+            import pyogrio
+
+            pyogrio.write_dataframe(gdf, buf, driver="FlatGeobuf")
+        except Exception:
+            # Fallback to geopandas built-in (also uses pyogrio/fiona)
+            gdf.to_file(buf, driver="FlatGeobuf")
+        return buf.getvalue()
+
+    @app.get("/overlays/{name}.fgb")
+    async def overlay_fgb(name: str) -> Response:
+        """Serve shape layer as FlatGeobuf binary for fast WebGL rendering."""
+        wsi = current_wsi()
+        if name not in wsi.shapes:
+            raise HTTPException(status_code=404, detail=f"Shape '{name}' not found in wsi.shapes")
+
+        key = (state["current"], name)
+        if key in _fgb_cache:
+            data = _fgb_cache[key]
+        else:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(_executor, _build_fgb, wsi.shapes[name])
+            _fgb_cache[key] = data
+
+        etag = f'W/"{hash((key, len(data))):x}"'
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "public, max-age=3600",
+                "ETag": etag,
+            },
+        )
+
+    # ── Graceful shutdown: release resources ─────────────────────────────
+    @app.on_event("shutdown")
+    async def _cleanup() -> None:
+        _log.info("Shutdown: releasing resources …")
+        # Drop FGB cache
+        _fgb_cache.clear()
+        # Close WSI handles (best-effort)
+        for i, spec in enumerate(specs):
+            wsi = spec.wsi
+            for attr in ("close", "_close", "release"):
+                fn = getattr(wsi, attr, None)
+                if callable(fn):
+                    try:
+                        fn()
+                        break
+                    except Exception as exc:
+                        _log.debug("slide %d %s() failed: %s", i, attr, exc)
+        # Shutdown shared executor (wait=False so 2nd Ctrl-C not blocked)
+        try:
+            _executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            _log.debug("executor shutdown failed: %s", exc)
+        _log.info("Shutdown complete.")
 
     return app
