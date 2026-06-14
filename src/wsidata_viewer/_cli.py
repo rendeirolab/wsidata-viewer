@@ -25,8 +25,12 @@ import click
               help="Open the viewer in the default browser.")
 @click.option("--store", "zarr_store", default=None, metavar="PATH",
               help="Path to the .zarr store for shape/table data (default: auto).")
-@click.option("--workers", default=4, show_default=True,
-              help="Number of parallel workers for opening slides.")
+@click.option("--workers", default=None, type=int,
+              help="Parallel workers for opening slides (default: min(16, cpu*2)).")
+@click.option("--eager", "eager", default=8, show_default=True,
+              help="Number of slides to open eagerly at startup. The remainder "
+                   "are opened on demand when the user clicks them. Set 0 to "
+                   "open only slide 0.")
 def main(
     slides: tuple[str, ...],
     table_path: str | None,
@@ -37,7 +41,8 @@ def main(
     jpeg_quality: int,
     open_browser: bool,
     zarr_store: str | None,
-    workers: int,
+    workers: int | None,
+    eager: int,
 ) -> None:
     """Launch an interactive viewer for one or more whole slide images.
 
@@ -80,31 +85,53 @@ def main(
     # zarr_store CLI flag is used as the fallback when a row has no store_path.
     fallback_zarr = zarr_store if zarr_store is not None else "auto"
 
-    # ── Open slides in parallel ───────────────────────────────────────────
-    # Slide 0 (the initial active slide): full open with zarr store.
-    # Slides 1..N: reader-only (store=None) — zarr loaded lazily on first select.
+    # ── Open slides: hybrid eager + lazy ──────────────────────────────────
+    # Slide 0: full open with zarr store (active, shapes available).
+    # Slides 1..min(eager, n-1): reader-only parallel open (snappy thumbnails
+    # + instant switching for the first batch).
+    # Slides eager+1..n-1: NOT opened. Will be opened on demand by the server
+    # via _ensure_opened() on first thumbnail/select request.
     n = len(slide_entries)
+
+    if workers is None:
+        import os
+        workers = min(16, (os.cpu_count() or 4) * 2)
+
+    eager_n = min(max(eager, 0), n - 1) if n > 1 else 0  # slides 1..eager_n
+    eager_total = 1 + eager_n  # slide 0 + eager_n reader-only
+
     click.echo(
-        f"Opening {n} slide{'s' if n > 1 else ''} "
-        f"({'parallel' if n > 1 else 'single'}) …",
+        f"Opening {eager_total} of {n} slide{'s' if n > 1 else ''} eagerly "
+        f"(workers={workers}); remaining {n - eager_total} opened on demand …",
         err=True,
     )
 
-    results: list[SlideSpec | None] = [None] * n
+    specs: list[SlideSpec] = [None] * n  # type: ignore[list-item]
 
-    def _open_active(wsi_path: str, store: str) -> SlideSpec:
-        wsi = open_wsi(wsi_path, store=store)
-        return SlideSpec(wsi=wsi, path=wsi_path, zarr_store=store, zarr_loaded=True)
+    # Pre-populate ALL specs with path + name so /slides listing works without
+    # opening anything. Eager ones get their .wsi filled in below.
+    for i, (wsi_path, store_path) in enumerate(slide_entries):
+        store = store_path if store_path is not None else fallback_zarr
+        specs[i] = SlideSpec(
+            wsi=None,
+            path=wsi_path,
+            zarr_store=store,
+            zarr_loaded=False,
+            name=Path(wsi_path).stem,
+        )
 
-    def _open_reader_only(wsi_path: str, store: str) -> SlideSpec:
-        wsi = open_wsi(wsi_path, store=None)
-        return SlideSpec(wsi=wsi, path=wsi_path, zarr_store=store, zarr_loaded=False)
+    def _open_active(wsi_path: str, store: str):
+        return open_wsi(wsi_path, store=store)
 
-    with ThreadPoolExecutor(max_workers=min(workers, n)) as pool:
+    def _open_reader_only(wsi_path: str, _store: str):
+        return open_wsi(wsi_path, store=None)
+
+    n_to_open = eager_total
+    with ThreadPoolExecutor(max_workers=min(workers, max(n_to_open, 1))) as pool:
         future_to_idx = {}
-        for i, (wsi_path, store_path) in enumerate(slide_entries):
-            # Each entry's store: explicit per-row value, else CLI fallback
-            store = store_path if store_path is not None else fallback_zarr
+        for i in range(n_to_open):
+            wsi_path = slide_entries[i][0]
+            store = specs[i].zarr_store or "auto"
             fn = _open_active if i == 0 else _open_reader_only
             future_to_idx[pool.submit(fn, wsi_path, store)] = i
 
@@ -112,8 +139,10 @@ def main(
             i = future_to_idx[future]
             wsi_path, _ = slide_entries[i]
             try:
-                spec = future.result()
-                results[i] = spec
+                wsi = future.result()
+                spec = specs[i]
+                spec.wsi = wsi
+                spec.zarr_loaded = (i == 0)
                 label = "(active, zarr loaded)" if i == 0 else "(reader-only)"
                 shapes_info = ""
                 if spec.zarr_loaded and spec.wsi.shapes:
@@ -123,7 +152,11 @@ def main(
                 click.echo(f"  [{i}] ERROR opening {wsi_path}: {exc}", err=True)
                 raise click.ClickException(f"Failed to open slide: {wsi_path}") from exc
 
-    specs: list[SlideSpec] = results  # type: ignore[assignment]
+    if n > eager_total:
+        click.echo(
+            f"  [{eager_total}..{n - 1}] deferred — open on demand",
+            err=True,
+        )
 
     # ── Start server ──────────────────────────────────────────────────────
     if port is None:
@@ -135,9 +168,10 @@ def main(
     url = f"http://{host}:{port}"
 
     if open_browser:
-        @app.on_event("startup")
-        async def _open_browser():
-            threading.Timer(0.5, webbrowser.open, args=[url]).start()
+        # Fire shortly after uvicorn starts binding the socket. A small delay
+        # is enough — by 0.5 s uvicorn has the listener up and the browser
+        # connect will be queued cleanly.
+        threading.Timer(0.5, webbrowser.open, args=[url]).start()
 
     click.echo(
         f"Viewer → {url}  ({n} slide{'s' if n != 1 else ''}, Ctrl-C to stop)",

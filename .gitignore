@@ -1,13 +1,69 @@
-# Python-generated files
+# macOS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+.python-version
+
+# Python caches and build artifacts
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
 
-data/
+# Node / frontend dependencies and local build caches
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.svelte-kit/
+frontend/.vite/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local agent/tool state
 .claude/
+.codex/
+
+# Local WSI data and generated analysis outputs
+data/
+*.zarr/
+*.ome.zarr/
+*.h5ad
+*.h5
+*.svs
+*.tif
+*.tiff
+*.ndpi
+*.mrxs
+
+# Keep the compiled package frontend committable. It is built by
+# `cd frontend && npm run build` and shipped from the Python wheel.
+!src/wsidata_viewer/static/
+!src/wsidata_viewer/static/**

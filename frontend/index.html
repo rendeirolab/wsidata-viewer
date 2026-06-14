@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wsidata viewer — dev</title>
+    <link rel="icon" type="image/webp" href="/favicon.webp" />
+    <!--
+      Dev-only bootstrap. In production the Python server injects a bootstrap
+      JSON block inside the rendered viewer.html. For `npm run dev` we point
+      at slide 0 directly so HMR works without a Python round-trip per reload.
+    -->
+    <script id="bootstrap" type="application/json">
+      {
+        "slide_id": 0,
+        "slide_name": "(dev)",
+        "slide_width": 0,
+        "slide_height": 0,
+        "dzi_url": "/slides/0/slide.dzi",
+        "properties": { "mpp": null, "magnification": null, "n_level": 0, "level_shape": [] },
+        "layer_colors": ["#4488ff","#ff4444","#44bb44","#ff8800","#aa44ff","#00bbbb","#ffcc00","#ff44aa"],
+        "multi_slide": true
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

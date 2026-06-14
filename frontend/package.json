@@ -1,0 +1,41 @@
+{
+  "name": "wsidata-viewer-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Svelte 5 + TS frontend for wsidata-viewer. Builds into ../src/wsidata_viewer/static/ — shipped inside the Python wheel.",
+  "scripts": {
+    "dev": "vite",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "build:nocheck": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "openseadragon": "4.1.1",
+    "@deck.gl/core": "9.0.27",
+    "@deck.gl/layers": "9.0.27",
+    "@luma.gl/core": "9.0.27",
+    "@luma.gl/engine": "9.0.27",
+    "@luma.gl/shadertools": "9.0.27",
+    "@luma.gl/webgl": "9.0.27",
+    "flatgeobuf": "3.27.2"
+  },
+  "overrides": {
+    "@luma.gl/core": "9.0.27",
+    "@luma.gl/engine": "9.0.27",
+    "@luma.gl/shadertools": "9.0.27",
+    "@luma.gl/webgl": "9.0.27",
+    "@luma.gl/constants": "9.0.27"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "5.0.3",
+    "@tsconfig/svelte": "5.0.4",
+    "@types/openseadragon": "3.0.10",
+    "svelte": "5.16.0",
+    "svelte-check": "4.1.1",
+    "tslib": "2.8.1",
+    "typescript": "5.7.2",
+    "vite": "6.0.5"
+  }
+}
