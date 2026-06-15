@@ -286,6 +286,8 @@ export async function selectSlide(id: number): Promise<void> {
   const signal = selectController.reset();
   appState.currentSlideId = id;
   clearOverlayState();
+  appState.layerListState = "loading";
+  appState.layerListError = null;
   clearLayerPayloads();
   v.deck?.setLayers([]);
   drawAll();
@@ -317,6 +319,10 @@ export async function selectSlide(id: number): Promise<void> {
     await loadLayers(id, signal);
   } catch (err) {
     if (isAbort(err)) return;
+    if (id === appState.currentSlideId) {
+      appState.layerListState = "error";
+      appState.layerListError = err instanceof Error ? err.message : String(err);
+    }
     console.error("Slide switch failed:", err);
   } finally {
     switchLock = false;
@@ -327,6 +333,8 @@ export async function selectSlide(id: number): Promise<void> {
 export async function loadLayers(slideId?: number, signal?: AbortSignal): Promise<void> {
   const id = slideId ?? appState.currentSlideId;
   const sig = signal ?? selectController.signal;
+  appState.layerListState = "loading";
+  appState.layerListError = null;
   try {
     const overlays = await api.listOverlays(id, sig);
     if (id !== appState.currentSlideId) return;
@@ -353,8 +361,14 @@ export async function loadLayers(slideId?: number, signal?: AbortSignal): Promis
       }
     }
     appState.layers = next;
+    appState.layerListState = "loaded";
   } catch (err) {
     if (isAbort(err)) return;
+    if (id !== appState.currentSlideId) return;
+    appState.layers = {};
+    appState.layerOrder = [];
+    appState.layerListState = "error";
+    appState.layerListError = err instanceof Error ? err.message : String(err);
     console.error("Failed to load overlays:", err);
   }
 }

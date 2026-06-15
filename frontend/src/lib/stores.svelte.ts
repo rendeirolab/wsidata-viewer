@@ -59,6 +59,11 @@ export const appState = $state({
   // Ordered layer names — preserves the order returned by /overlays.
   layerOrder: [] as string[],
 
+  // Layer list request state. Used by the panel to distinguish "empty"
+  // from "still loading after a slide switch".
+  layerListState: "idle" as "idle" | "loading" | "loaded" | "error",
+  layerListError: null as string | null,
+
   // Persistent style overrides; survive slide switches by layer-name key.
   layerStyles: {} as Record<string, LayerStyle>,
 

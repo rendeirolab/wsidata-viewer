@@ -4,6 +4,7 @@
   import LayerRow from "./LayerRow.svelte";
 
   let open = $state(true);
+  let isLoading = $derived(appState.layerListState === "loading");
 </script>
 
 <div id="layers-panel" class="fp">
@@ -21,7 +22,16 @@
   </div>
   <div class="fp-body" class:collapsed={!open}>
     <div id="layer-controls">
-      {#if appState.layerOrder.length === 0}
+      {#if isLoading}
+        <div class="layers-status">
+          <span class="layer-spinner">↻</span>
+          <span>Loading layer data...</span>
+        </div>
+      {:else if appState.layerListState === "error"}
+        <div class="layers-status error" title={appState.layerListError ?? "Failed to load layers"}>
+          Failed to load layers
+        </div>
+      {:else if appState.layerOrder.length === 0}
         <div class="no-layers">No shapes in wsi.shapes</div>
       {:else}
         {#each appState.layerOrder as name (name)}
@@ -29,7 +39,7 @@
         {/each}
       {/if}
     </div>
-    <button class="refresh-btn" onclick={() => loadLayers()}>
+    <button class="refresh-btn" onclick={() => loadLayers()} disabled={isLoading}>
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="23 4 23 10 17 10"/>
         <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
